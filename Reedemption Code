@@ -1,0 +1,287 @@
+public ResponseEntity<ResponseDTO> redeemTransactional(@RequestBody BurnTransactionalCardDTO burnTransactionalCardDTO) {
+		return redeemManagementService.redeemTransactionalWithQueue(burnTransactionalCardDTO, Boolean.TRUE, TransactionSource.REDEEM_CARD);
+	}
+
+
+public ResponseEntity<ResponseDTO> redeemTransactionalWithQueue(BurnTransactionalCardDTO burnTransactionalCardDTO,
+			Boolean toRedeem, TransactionSource source) {
+		// synchronized (burnTransactionalCardDTO.getRedemptionPointId()) {
+		Long queueId = null;
+		Integer retryCount = 0;
+		UserDetailEntity user = null;
+		ResponseEntity<ResponseDTO> response = null;
+		RedemptionPointEntity redemptionPointEntity = null;
+		while (true) {
+			response = saveRedeemQueue(burnTransactionalCardDTO, redemptionPointEntity, user, null);
+			if (!HttpStatus.OK.equals(response.getStatusCode())) {
+				try {
+					if (++retryCount > 5) {
+						return response;
+					}
+					Thread.sleep(100);
+				} catch (InterruptedException e) {
+					e.printStackTrace();
+					log.error("Error while putting thread to sleep for catalog queue: {}", e.getLocalizedMessage());
+
+					return response;
+				}
+			} else if (Validators.isNotEmpty(response.getBody())
+					&& Validators.isNotEmpty(response.getBody().getData())) {
+				queueId = response.getBody().getData() instanceof Long ? (Long) response.getBody().getData() : null;
+				break;
+			}
+		}
+
+		response = redeemTransactionalCard(burnTransactionalCardDTO, user, toRedeem, source);
+		if (Validators.isNotEmpty(queueId)) {
+			deleteRedeemQueue(queueId);
+		}
+		return response;
+		// }
+	}
+
+
+@Transactional
+	private ResponseEntity<ResponseDTO> saveRedeemQueue(BurnTransactionalCardDTO burnTransactionalCardDTO,
+			RedemptionPointEntity redemptionPointEntity, UserDetailEntity user, Double points) {
+
+		RedeemQueueEntity redeemQueueEntity = null;
+		try {
+			user = userManagementService.getOnboardUserByUid(burnTransactionalCardDTO.getUid());
+			redemptionPointEntity = redemptionPointRepository.findById(burnTransactionalCardDTO.getRedemptionPointId())
+					.orElse(null);
+
+			if (Validators.isEmpty(user)) {
+				log.error(localeTranslator.getMessage("transaction.user.not-found") + " : {}",
+						burnTransactionalCardDTO.getUid());
+				return composeResponse.compose(HttpStatus.PARTIAL_CONTENT,
+						Optional.of(ResponsesStatus.VALIDATION_FAILURE),
+						localeTranslator.getMessage("transaction.user.not-found"));
+			}
+			if (Validators.isEmpty(user.getTier())) {
+				log.error("User tier not found : {}", user);
+				return composeResponse.compose(HttpStatus.PARTIAL_CONTENT,
+						Optional.of(ResponsesStatus.VALIDATION_FAILURE),
+						localeTranslator.getMessage("redeem.queue.user.tier.not-found"));
+			}
+
+			if (Validators.isEmpty(redemptionPointEntity)) {
+				return composeResponse.compose(HttpStatus.PARTIAL_CONTENT,
+						Optional.of(ResponsesStatus.VALIDATION_FAILURE),
+						localeTranslator.getMessage("transaction.redemption.points.not-found"));
+			}
+
+			//setting points based on user-tier
+			ResponseEntity<ResponseDTO> response = setPointsBasedOnUserTier(redemptionPointEntity, user.getTier());
+			if (response != null) {
+				return response;
+			}
+
+			redeemQueueEntity = convertToRedeemQueueEntity(burnTransactionalCardDTO, user,
+					redemptionPointEntity.getPoints());
+			redeemQueueEntity = redeemQueueRepository.save(redeemQueueEntity);
+
+			return composeResponse.compose(HttpStatus.OK, localeTranslator.getMessage("redeem.queue.success"),
+					redeemQueueEntity.getId());
+
+		} catch (ConstraintViolationException | DataIntegrityViolationException e) {
+			log.error("Could not save redeem in the queue. Already another redeem of the uid: {} is in process",
+					burnTransactionalCardDTO.getUid());
+			return composeResponse.compose(HttpStatus.PARTIAL_CONTENT, Optional.of(ResponsesStatus.VALIDATION_FAILURE),
+					localeTranslator.getMessage("redeem.queue.uid.present",
+							new Object[] { burnTransactionalCardDTO.getUid() }));
+		} catch (Exception e) {
+			log.error("Could not save redeem in the queue");
+			log.error("Exception: {}", e.getLocalizedMessage());
+			return composeResponse.compose(HttpStatus.PARTIAL_CONTENT, Optional.of(ResponsesStatus.VALIDATION_FAILURE),
+					localeTranslator.getMessage("redeem.queue.failure"));
+		}
+	}private ResponseEntity<ResponseDTO> redeemTransactionalCard(BurnTransactionalCardDTO burnTransactionalCardDTO,
+			UserDetailEntity user, Boolean toRedeem, TransactionSource source) {
+		log.info("Request to redeem points for a card, dto: {}", burnTransactionalCardDTO.toString());
+		try {
+			Double points = 0.0;
+			user = userDetailRepository.findByUid(burnTransactionalCardDTO.getUid()).orElse(null);
+			if (Validators.isEmpty(user)) {
+				log.error(localeTranslator.getMessage("transaction.user.not-found") + " : {}",
+						burnTransactionalCardDTO.getUid());
+				return composeResponse.compose(HttpStatus.PARTIAL_CONTENT,
+						Optional.of(ResponsesStatus.VALIDATION_FAILURE),
+						localeTranslator.getMessage("transaction.user.not-found"));
+			} else if (Validators.isEmpty(user.getStatus()) || Boolean.FALSE.equals(user.getStatus())) {
+				log.error(localeTranslator.getMessage("transaction.user.inactive") + " : {}",
+						burnTransactionalCardDTO.getUid());
+				return composeResponse.compose(HttpStatus.PARTIAL_CONTENT,
+						Optional.of(ResponsesStatus.VALIDATION_FAILURE),
+						localeTranslator.getMessage("transaction.user.inactive"));
+			}else if (Validators.isEmpty(user.getTier())) {
+				log.error("User tier not found : {}", user);
+				return composeResponse.compose(HttpStatus.PARTIAL_CONTENT,
+						Optional.of(ResponsesStatus.VALIDATION_FAILURE),
+						localeTranslator.getMessage("redeem.queue.user.tier.not-found"));
+			}
+
+			RedemptionPointEntity redemptionPointEntity = redemptionPointRepository
+					.findById(burnTransactionalCardDTO.getRedemptionPointId()).orElse(null);
+			if (Validators.isEmpty(redemptionPointEntity)) {
+				log.error(localeTranslator.getMessage("transaction.redemption.points.not-found") + " : {}",
+						burnTransactionalCardDTO.getRedemptionPointId());
+				return composeResponse.compose(HttpStatus.PARTIAL_CONTENT,
+						Optional.of(ResponsesStatus.VALIDATION_FAILURE),
+						localeTranslator.getMessage("transaction.redemption.points.not-found"));
+			} else if (Boolean.FALSE.equals(redemptionPointEntity.getStatus())) {
+				log.error(localeTranslator.getMessage("transaction.catalog.status") + " : {}",
+						burnTransactionalCardDTO.getRedemptionPointId());
+				return composeResponse.compose(HttpStatus.PARTIAL_CONTENT,
+						Optional.of(ResponsesStatus.VALIDATION_FAILURE),
+						localeTranslator.getMessage("transaction.catalog.status"));
+			}
+			
+			ResponseEntity<ResponseDTO> response = setPointsBasedOnUserTier(redemptionPointEntity, user.getTier());
+			if(response != null) {
+				return response;
+			}
+			
+			if (RedemptionCategoryConstant.ADD_ON.equals(redemptionPointEntity.getCategory())) {
+				Map<String, Object> packDetails = thirdPartyVoucherPushService
+						.getPackListingFromDb(burnTransactionalCardDTO.getMobile(), redemptionPointEntity.getPackId());
+				if (packDetails.isEmpty()) {
+					log.error(localeTranslator.getMessage("transaction.redemption.pack.not-found") + " : {}",
+							redemptionPointEntity.getPackId());
+					return composeResponse.compose(HttpStatus.PARTIAL_CONTENT,
+							Optional.of(ResponsesStatus.VALIDATION_FAILURE),
+							localeTranslator.getMessage("transaction.redemption.pack.not-found"));
+				} else if (!NumberUtils.isParsable(String.valueOf(packDetails.get(responsePriceKeyList)))) {
+					log.error(localeTranslator.getMessage("transaction.redemption.price.not-parseable") + " : {}",
+							String.valueOf(packDetails.get(responsePriceKeyList)));
+					return composeResponse.compose(HttpStatus.PARTIAL_CONTENT,
+							Optional.of(ResponsesStatus.VALIDATION_FAILURE),
+							localeTranslator.getMessage("transaction.redemption.price.not-parseable"));
+				} else {
+//					points = Double.parseDouble(String.valueOf(packDetails.get(responsePriceKeyList)));
+					points = redemptionPointEntity.getPoints();
+				}
+
+				// check user has sufficient point
+				if (!checkUserAvailablePoints(user.getId(), points)) {
+					log.error(localeTranslator.getMessage("transaction.point.not-sufficient") + " for uid : {}",
+							burnTransactionalCardDTO.getUid());
+					return composeResponse.compose(HttpStatus.PARTIAL_CONTENT,
+							Optional.of(ResponsesStatus.VALIDATION_FAILURE),
+							localeTranslator.getMessage("transaction.point.not-sufficient"));
+				}
+			} else {
+				// check user has sufficient point
+				if (!checkUserAvailablePoints(user.getId(), redemptionPointEntity.getPoints())) {
+					log.error(localeTranslator.getMessage("transaction.point.not-sufficient") + " for uid : {}",
+							burnTransactionalCardDTO.getUid());
+					return composeResponse.compose(HttpStatus.PARTIAL_CONTENT,
+							Optional.of(ResponsesStatus.VALIDATION_FAILURE),
+							localeTranslator.getMessage("transaction.point.not-sufficient"));
+				}
+			}
+
+      private Boolean checkUserAvailablePoints(Long userId, Double pointToRedeem) {
+		log.info("Get avaiblable points for user: {}", userId);
+		Double availablePoints = transactionPointsRepository.getUserAvailablePoints(userId, PointTransType.CREDIT);
+		availablePoints = Validators.isNotEmpty(availablePoints)
+				? Converters.toRoundedDecimal(availablePoints, decimalRoundOff)
+				: 0.0;
+
+		return (availablePoints - pointToRedeem < 0) ? false : true;
+	}
+
+      	Map<String, Object> exp = new HashMap<>();
+			RedeemCardDetailEntity redeemCardDetailEntity = saveCardRedemptionHistory(redemptionPointEntity, user,
+					burnTransactionalCardDTO,
+					RedemptionCategoryConstant.ADD_ON.equals(redemptionPointEntity.getCategory()) ? points
+							: redemptionPointEntity.getPoints(),
+					burnTransactionalCardDTO.getMobile());
+
+//			 deduct the point on basis of FCFS
+			redeemPointsSequential(user,
+					RedemptionCategoryConstant.ADD_ON.equals(redemptionPointEntity.getCategory()) ? points
+							: redemptionPointEntity.getPoints(),
+					convertAndMapToTransactionEntity(burnTransactionalCardDTO, user, redemptionPointEntity, source,
+							redeemCardDetailEntity, redemptionPointEntity.getCategory().toString(),
+							RedemptionCategoryConstant.ADD_ON.equals(redemptionPointEntity.getCategory()) ? points
+									: redemptionPointEntity.getPoints()),
+					toRedeem, exp);
+
+			// call the third party apis
+			thirdPartyVoucherPushService.callVoucherRedemption(redeemCardDetailEntity,
+					burnTransactionalCardDTO.getMobile(), redemptionPointEntity.getPackId());
+			redeemCardDetailsRepository.save(redeemCardDetailEntity);
+
+			if (RedeemApiStatusType.FAILURE.equals(redeemCardDetailEntity.getStatus())) {
+				// reverse logic for failure scenarios
+				reverseRedeemTransactionalCard(redeemCardDetailEntity, user, redeemCardDetailEntity.getResponse(),
+						(Date) exp.get("expiryDate"), (Integer) exp.get("expireNotiDays"),
+						RedemptionCategoryConstant.ADD_ON.equals(redemptionPointEntity.getCategory()) ? points
+								: redemptionPointEntity.getPoints(),
+						redemptionPointEntity.getCategory().toString());
+			}
+
+		} catch (Exception e) {
+			log.error(e.getLocalizedMessage());
+			return composeResponse.compose(HttpStatus.PARTIAL_CONTENT, Optional.of(ResponsesStatus.VALIDATION_FAILURE),
+					localeTranslator.getMessage("transaction.redeem.card.failure"));
+		}
+		return composeResponse.compose(HttpStatus.OK, localeTranslator.getMessage("transaction.redeem.card.success"));
+	}private void redeemPointsSequential(UserDetailEntity user, Double pointToRedeem,
+			TransactionPointsEntity transactionDetail, Boolean toRedeem, Map<String, Object> exp) {
+		log.info("Redeem points for user: {}", user);
+		Date expiryDate = new Date(0);
+		Integer expireNotiDays = 0;
+		List<TransactionPointsEntity> transactionPointDetails = transactionPointsRepository
+				.findCreditTrans(user.getId(), PointTransType.CREDIT);
+
+		if (Validators.isNotEmpty(transactionPointDetails)) {
+			for (TransactionPointsEntity transaction : transactionPointDetails) {
+				expiryDate = transaction.getClaimExpDate().after(expiryDate) ? transaction.getClaimExpDate()
+						: expiryDate;
+				expireNotiDays = transaction.getExpiredPointsNotiBeforeDays() > expireNotiDays
+						? transaction.getExpiredPointsNotiBeforeDays()
+						: expireNotiDays;
+				if (pointToRedeem <= 0)
+					break;
+				if (transaction.getAvailablePoints() - pointToRedeem > 0) {
+					Double availablePoints = Converters
+							.toRoundedDecimal(transaction.getAvailablePoints() - pointToRedeem, decimalRoundOff);
+					transaction.setAvailablePoints(availablePoints);
+					pointToRedeem = 0.0;
+					break;
+				} else if (transaction.getAvailablePoints() - pointToRedeem <= 0) {
+					pointToRedeem = pointToRedeem - transaction.getAvailablePoints();
+					transaction.setAvailablePoints(0.0);
+				}
+			}
+		}
+		exp.put("expiryDate", expiryDate);
+		exp.put("expireNotiDays", expireNotiDays);
+
+		transactionPointDetails.add(transactionDetail);
+		transactionPointsRepository.saveAll(transactionPointDetails);
+
+		// redeem from user available points
+		userManagementService.redeemPoints(user, transactionDetail.getPoints(), toRedeem);
+	}
+@Transactional
+	public UserDetailEntity redeemPoints(UserDetailEntity user, Double pointsToRedeem, Boolean toRedeem) {
+		//		user.setAvailablePoints(Validators.isNotEmpty(user.getAvailablePoints()) && user.getAvailablePoints() > pointsToRedeem ? user.getAvailablePoints() - pointsToRedeem : 0);
+		//		user.setRedeemPoints(toRedeem ? user.getRedeemPoints() + pointsToRedeem : user.getRedeemPoints());
+
+		userDetailRepository.redeemPointsFromUser(pointsToRedeem, user.getId(), toRedeem);
+		return user;
+	}	@Modifying
+	@Transactional
+	@Query("UPDATE UserDetailEntity SET redeemPoints = CASE \n"
+			+ 	"WHEN ?3 = true THEN (ROUND(redeemPoints + ?1, 2)) \n"
+			+ 	"ELSE redeemPoints \n"
+			+ "END \n"
+			+ ", availablePoints = CASE \n"
+			+ 	"WHEN availablePoints > ?1 THEN (ROUND(availablePoints - ?1, 2)) \n"
+			+ 	"ELSE 0.0 \n"
+			+ "END \n"
+			+ "WHERE id = ?2")
+	void redeemPointsFromUser(Double pointsToRedeem, Long id, Boolean toRedeem);
