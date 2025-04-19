@@ -1,0 +1,6 @@
+https://codeforces.com/contest/2074/problem/C
+
+Formula to add two xor number
+a+b=(a^b)+2*(a&b)
+
+
